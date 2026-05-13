@@ -1,0 +1,307 @@
+const express = require("express");
+const Database = require("better-sqlite3");
+
+const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Database
+const db = new Database("mvp.db");
+
+// Tables
+db.exec(`
+CREATE TABLE IF NOT EXISTS expenses (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  amount REAL NOT NULL,
+  category TEXT NOT NULL,
+  date TEXT NOT NULL  -- YYYY-MM-DD
+);
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  amount REAL NOT NULL,
+  category TEXT NOT NULL,
+  frequency TEXT NOT NULL,          -- monthly|weekly
+  next_billing_date TEXT NOT NULL   -- YYYY-MM-DD
+);
+`);
+
+const insertExpense = db.prepare(`
+  INSERT INTO expenses (title, amount, category, date)
+  VALUES (@title, @amount, @category, @date)
+`);
+
+const insertSubscription = db.prepare(`
+  INSERT INTO subscriptions (name, amount, category, frequency, next_billing_date)
+  VALUES (@name, @amount, @category, @frequency, @next_billing_date)
+`);
+
+const listExpenses = db.prepare(`
+  SELECT * FROM expenses ORDER BY date DESC, id DESC LIMIT 200
+`);
+
+const listSubscriptions = db.prepare(`
+  SELECT * FROM subscriptions ORDER BY next_billing_date ASC, id DESC LIMIT 200
+`);
+
+const monthlyRecurringTotal = db.prepare(`
+  SELECT
+    COALESCE(SUM(
+      CASE
+        WHEN frequency = 'monthly' THEN amount
+        WHEN frequency = 'weekly' THEN amount * 4.345
+        ELSE 0
+      END
+    ), 0) AS total
+  FROM subscriptions
+`);
+
+function ymd(d = new Date()) {
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function monthStart(d = new Date()) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-01`;
+}
+
+const spendThisMonthStmt = db.prepare(`
+  SELECT COALESCE(SUM(amount), 0) AS total
+  FROM expenses
+  WHERE date >= @from AND date <= @to
+`);
+
+// API
+app.get("/api/summary", (req, res) => {
+  const today = ymd();
+  const from = monthStart();
+  const spendThisMonth = spendThisMonthStmt.get({ from, to: today }).total;
+  const recurringMonthly = monthlyRecurringTotal.get().total;
+
+  res.json({
+    today,
+    month_from: from,
+    spend_this_month: Number(spendThisMonth.toFixed(2)),
+    monthly_recurring_estimate: Number(recurringMonthly.toFixed(2)),
+  });
+});
+
+app.get("/api/expenses", (req, res) => res.json(listExpenses.all()));
+
+app.post("/api/expenses", (req, res) => {
+  const { title, amount, category, date } = req.body;
+  if (!title || !amount || !category || !date) {
+    return res.status(400).json({ error: "Missing fields" });
+  }
+  const info = insertExpense.run({
+    title: String(title).trim(),
+    amount: Number(amount),
+    category: String(category).trim(),
+    date: String(date).trim(),
+  });
+  res.status(201).json({ id: info.lastInsertRowid });
+});
+
+app.get("/api/subscriptions", (req, res) => res.json(listSubscriptions.all()));
+
+app.post("/api/subscriptions", (req, res) => {
+  const { name, amount, category, frequency, next_billing_date } = req.body;
+  if (!name || !amount || !category || !frequency || !next_billing_date) {
+    return res.status(400).json({ error: "Missing fields" });
+  }
+  if (!["monthly", "weekly"].includes(frequency)) {
+    return res.status(400).json({ error: "frequency must be monthly or weekly" });
+  }
+  const info = insertSubscription.run({
+    name: String(name).trim(),
+    amount: Number(amount),
+    category: String(category).trim(),
+    frequency,
+    next_billing_date: String(next_billing_date).trim(),
+  });
+  res.status(201).json({ id: info.lastInsertRowid });
+});
+
+// Minimal UI
+app.get("/", (req, res) => {
+  res.type("html").send(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Money MVP</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; max-width: 1000px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 14px; }
+    input, select { width: 100%; padding: 8px; margin: 6px 0 10px; }
+    button { padding: 10px 12px; cursor: pointer; }
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    th, td { text-align: left; border-bottom: 1px solid #eee; padding: 8px; font-size: 14px; }
+    .muted { color: #666; font-size: 13px; }
+    .kpi { font-size: 18px; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h2>Subscription + Spending Tracker (MVP)</h2>
+  <div class="muted">Data stored locally in <code>mvp.db</code>.</div>
+
+  <div class="card" style="margin-top: 14px;">
+    <div id="summary"></div>
+  </div>
+
+  <div class="row" style="margin-top: 16px;">
+    <div class="card">
+      <h3>Add Expense</h3>
+      <label>Title</label>
+      <input id="e_title" placeholder="e.g., Groceries" />
+      <label>Amount</label>
+      <input id="e_amount" type="number" step="0.01" placeholder="e.g., 1200" />
+      <label>Category</label>
+      <input id="e_category" placeholder="e.g., Food" />
+      <label>Date</label>
+      <input id="e_date" type="date" />
+      <button onclick="addExpense()">Save expense</button>
+      <div id="e_msg" class="muted"></div>
+    </div>
+
+    <div class="card">
+      <h3>Add Subscription</h3>
+      <label>Name</label>
+      <input id="s_name" placeholder="e.g., Netflix" />
+      <label>Amount</label>
+      <input id="s_amount" type="number" step="0.01" placeholder="e.g., 1100" />
+      <label>Category</label>
+      <input id="s_category" placeholder="e.g., Entertainment" />
+      <label>Frequency</label>
+      <select id="s_frequency">
+        <option value="monthly">monthly</option>
+        <option value="weekly">weekly</option>
+      </select>
+      <label>Next billing date</label>
+      <input id="s_next" type="date" />
+      <button onclick="addSubscription()">Save subscription</button>
+      <div id="s_msg" class="muted"></div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top: 16px;">
+    <div class="card">
+      <h3>Recent Expenses</h3>
+      <table>
+        <thead><tr><th>Date</th><th>Title</th><th>Category</th><th>Amount</th></tr></thead>
+        <tbody id="expenses"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>Subscriptions</h3>
+      <table>
+        <thead><tr><th>Next</th><th>Name</th><th>Freq</th><th>Amount</th></tr></thead>
+        <tbody id="subs"></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+  const today = new Date().toISOString().slice(0, 10);
+  document.getElementById("e_date").value = today;
+  document.getElementById("s_next").value = today;
+
+  function escapeHtml(str) {
+    return String(str).replace(/[&<>"']/g, m => ({
+      "&":"&", "<":"<", ">":">", '"':""", "'":"&#39;"
+    }[m]));
+  }
+
+  async function refresh() {
+    const sum = await fetch("/api/summary").then(r => r.json());
+    document.getElementById("summary").innerHTML = \`
+      <div class="muted">Summary (as of \${sum.today})</div>
+      <div style="display:flex; gap: 24px; flex-wrap: wrap; margin-top: 8px;">
+        <div><div class="muted">Spend this month</div><div class="kpi">\${sum.spend_this_month.toLocaleString()}</div></div>
+        <div><div class="muted">Monthly recurring (estimate)</div><div class="kpi">\${sum.monthly_recurring_estimate.toLocaleString()}</div></div>
+      </div>
+    \`;
+
+    const expenses = await fetch("/api/expenses").then(r => r.json());
+    document.getElementById("expenses").innerHTML = expenses.map(e => \`
+      <tr>
+        <td>\${e.date}</td>
+        <td>\${escapeHtml(e.title)}</td>
+        <td>\${escapeHtml(e.category)}</td>
+        <td>\${Number(e.amount).toLocaleString()}</td>
+      </tr>
+    \`).join("");
+
+    const subs = await fetch("/api/subscriptions").then(r => r.json());
+    document.getElementById("subs").innerHTML = subs.map(s => \`
+      <tr>
+        <td>\${s.next_billing_date}</td>
+        <td>\${escapeHtml(s.name)}</td>
+        <td>\${s.frequency}</td>
+        <td>\${Number(s.amount).toLocaleString()}</td>
+      </tr>
+    \`).join("");
+  }
+
+  async function addExpense() {
+    const payload = {
+      title: document.getElementById("e_title").value,
+      amount: document.getElementById("e_amount").value,
+      category: document.getElementById("e_category").value,
+      date: document.getElementById("e_date").value,
+    };
+    const r = await fetch("/api/expenses", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const msg = document.getElementById("e_msg");
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: "Failed" }));
+      msg.textContent = "Error: " + err.error;
+      return;
+    }
+    msg.textContent = "Saved.";
+    document.getElementById("e_title").value = "";
+    document.getElementById("e_amount").value = "";
+    await refresh();
+  }
+
+  async function addSubscription() {
+    const payload = {
+      name: document.getElementById("s_name").value,
+      amount: document.getElementById("s_amount").value,
+      category: document.getElementById("s_category").value,
+      frequency: document.getElementById("s_frequency").value,
+      next_billing_date: document.getElementById("s_next").value,
+    };
+    const r = await fetch("/api/subscriptions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const msg = document.getElementById("s_msg");
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: "Failed" }));
+      msg.textContent = "Error: " + err.error;
+      return;
+    }
+    msg.textContent = "Saved.";
+    document.getElementById("s_name").value = "";
+    document.getElementById("s_amount").value = "";
+    await refresh();
+  }
+
+  refresh();
+</script>
+</body>
+</html>`);
+});
+
+
